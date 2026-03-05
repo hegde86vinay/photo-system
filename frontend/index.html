@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Photo System — System Design Learning App</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>📸 Photo System</h1>
+    <p class="subtitle">A system design learning app · 500M users · ~1 PB storage · 7-year retention</p>
+    <nav>
+      <button class="tab-btn active" data-tab="upload">⬆ Upload</button>
+      <button class="tab-btn" data-tab="view">🔍 View by ID</button>
+      <button class="tab-btn" data-tab="search">🔎 Search</button>
+      <button class="tab-btn" data-tab="architecture">🏗 Architecture</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ─── UPLOAD TAB ─────────────────────────────────────── -->
+    <section id="tab-upload" class="tab active">
+      <h2>Upload a Photo</h2>
+      <p class="concept-note">
+        <strong>Flow:</strong> Validate → MinIO HOT bucket → PostgreSQL → Elasticsearch → Presigned URL
+      </p>
+      <form id="upload-form">
+        <div class="field">
+          <label>Photo File <span class="required">*</span></label>
+          <input type="file" id="file-input" accept="image/*" required />
+          <div id="preview-container" style="display:none">
+            <img id="preview-img" alt="preview" />
+          </div>
+        </div>
+        <div class="field">
+          <label>Title <span class="required">*</span></label>
+          <input type="text" id="title-input" placeholder="e.g. Blue Sneakers Front View" required />
+        </div>
+        <div class="field">
+          <label>Product ID <span class="optional">(optional)</span></label>
+          <input type="text" id="product-id-input" placeholder="e.g. SKU-1234" />
+        </div>
+        <div class="field">
+          <label>User ID</label>
+          <input type="text" id="user-id-input" value="00000000-0000-0000-0000-000000000001" readonly />
+          <small>Using demo user (pre-seeded in PostgreSQL)</small>
+        </div>
+        <button type="submit" class="btn-primary" id="upload-btn">⬆ Upload Photo</button>
+      </form>
+
+      <div id="upload-result" class="result-box hidden">
+        <h3>✅ Upload Successful</h3>
+        <div class="result-grid" id="upload-details"></div>
+        <div class="tier-badge" id="upload-tier"></div>
+      </div>
+      <div id="upload-error" class="error-box hidden"></div>
+    </section>
+
+    <!-- ─── VIEW TAB ────────────────────────────────────────── -->
+    <section id="tab-view" class="tab hidden">
+      <h2>View Photo by ID</h2>
+      <p class="concept-note">
+        <strong>Flow:</strong> Redis cache-aside → PostgreSQL fallback → Presigned URL (1 hour)
+      </p>
+      <div class="field">
+        <label>Photo ID (UUID)</label>
+        <input type="text" id="view-id-input" placeholder="paste photo UUID here" />
+      </div>
+      <button class="btn-primary" id="view-btn">🔍 Fetch Photo</button>
+
+      <div id="view-result" class="result-box hidden">
+        <div class="photo-card">
+          <img id="view-img" alt="photo" />
+          <div class="photo-meta" id="view-details"></div>
+        </div>
+      </div>
+      <div id="view-error" class="error-box hidden"></div>
+    </section>
+
+    <!-- ─── SEARCH TAB ───────────────────────────────────────── -->
+    <section id="tab-search" class="tab hidden">
+      <h2>Search Photos</h2>
+      <p class="concept-note">
+        <strong>Powered by:</strong> Elasticsearch inverted index · BM25 relevance scoring · Fuzzy match
+      </p>
+      <div class="search-row">
+        <input type="text" id="search-q" placeholder="Search title… (e.g. sneakers)" />
+        <input type="text" id="search-product-id" placeholder="Product ID (e.g. SKU-1234)" />
+        <button class="btn-primary" id="search-btn">🔎 Search</button>
+      </div>
+
+      <div id="search-results" class="results-grid hidden"></div>
+      <div id="search-error" class="error-box hidden"></div>
+    </section>
+
+    <!-- ─── ARCHITECTURE TAB ─────────────────────────────────── -->
+    <section id="tab-architecture" class="tab hidden">
+      <h2>System Architecture</h2>
+
+      <div class="arch-diagram">
+        <pre>
+┌─────────────────────────────────────────────────────────────────┐
+│                    PHOTO SHARING SYSTEM                         │
+│                  500M users · ~1 PB · 7 years                   │
+└─────────────────────────────────────────────────────────────────┘
+
+   Browser/Client
+        │
+        ▼
+   ┌─────────┐     Static assets (this UI)
+   │  Nginx  │─────────────────────────────▶ CDN (prod)
+   │ :3000   │
+   └────┬────┘
+        │ API calls
+        ▼
+   ┌──────────┐
+   │  FastAPI │◀─── Stateless: horizontally scalable
+   │  :8000   │     N identical instances behind load balancer
+   └────┬─────┘
+        │
+   ┌────┼───────────────────────────────────┐
+   │    │                                   │
+   ▼    ▼                    ▼              ▼
+┌──────────┐  ┌──────────┐  ┌────────────┐  ┌────────────────────┐
+│PostgreSQL│  │  Redis   │  │Elasticsearch│  │    MinIO (S3)      │
+│  :5432   │  │  :6379   │  │   :9200    │  │ photos-hot   :9000 │
+│          │  │          │  │            │  │ photos-warm        │
+│Metadata  │  │ Metadata │  │ Inverted   │  │ photos-cold        │
+│5.1B rows │  │  Cache   │  │   Index    │  │                    │
+│Partitioned│ │LRU 256MB │  │Title/ProdID│  │ ~1 PB total        │
+│by year   │  │TTL 1hr   │  │ BM25 score │  │                    │
+└──────────┘  └──────────┘  └────────────┘  └────────────────────┘
+     ▲                                              ▲
+     │ source of truth                              │ binary blobs
+     │                                              │
+     └──────────────────────────────────────────────┘
+
+UPLOAD PATH:
+  Client → FastAPI → MinIO(HOT) → PostgreSQL → Elasticsearch
+  → Return presigned URL
+
+READ PATH (cache hit):
+  Client → FastAPI → Redis HIT → return metadata + presigned URL
+  → Client downloads directly from MinIO (bypasses backend)
+
+READ PATH (cache miss):
+  Client → FastAPI → Redis MISS → PostgreSQL → populate Redis
+  → return metadata + presigned URL
+
+STORAGE TIERING (daily cron):
+  HOT  → WARM:  not accessed in 365 days  (~40% cheaper)
+  WARM → COLD:  not accessed in 1095 days (~80% cheaper)
+        </pre>
+      </div>
+
+      <div class="concept-cards">
+        <div class="concept-card">
+          <h3>🗄 PostgreSQL — Table Partitioning</h3>
+          <p>Photos table partitioned by year (2024–2030). At 5.1B rows, queries hit only the relevant year-partition. Archival = DROP TABLE photos_2024 (instant vs. 730M DELETE rows).</p>
+        </div>
+        <div class="concept-card">
+          <h3>⚡ Redis — Cache-Aside Pattern</h3>
+          <p>Read: try cache → miss → DB → populate cache. Write: DB → invalidate cache. 80% cache hit ratio at 100:1 read:write = only 460 DB reads/sec instead of 2,300.</p>
+        </div>
+        <div class="concept-card">
+          <h3>🔎 Elasticsearch — Inverted Index</h3>
+          <p>LIKE '%keyword%' = full table scan at 5B rows. ES inverted index = O(1) lookup. Dual-write pattern: PostgreSQL (source of truth) + ES (search replica, eventual consistency).</p>
+        </div>
+        <div class="concept-card">
+          <h3>🪣 MinIO — Object Storage Tiers</h3>
+          <p>HOT→S3 Standard, WARM→S3-IA (40% cheaper), COLD→Glacier (80% cheaper). Presigned URLs bypass backend bandwidth bottleneck. ~60% cost savings at 1 PB scale.</p>
+        </div>
+        <div class="concept-card">
+          <h3>📊 Capacity Math</h3>
+          <p>2M photos/day × 200KB = 400GB/day. 7 years = ~1 PB. Peak QPS: 2,300 reads/sec. Bandwidth: ~460 MB/s = 3.68 Gbps peak. CDN mandatory.</p>
+        </div>
+        <div class="concept-card">
+          <h3>🔗 Presigned URLs</h3>
+          <p>Client downloads directly from MinIO/S3 — backend not in the bandwidth path. At 460 MB/s peak, this is essential. Signed with secret key, expire in 1 hour.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      API: <a href="http://localhost:8000/docs" target="_blank">localhost:8000/docs</a> ·
+      MinIO: <a href="http://localhost:9001" target="_blank">localhost:9001</a> ·
+      Health: <a href="http://localhost:8000/health" target="_blank">localhost:8000/health</a> ·
+      Metrics: <a href="http://localhost:8000/metrics" target="_blank">localhost:8000/metrics</a>
+    </p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

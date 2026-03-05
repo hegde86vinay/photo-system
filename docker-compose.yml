@@ -1,0 +1,191 @@
+version: "3.9"
+
+# ============================================================
+# SYSTEM DESIGN CONCEPT: Service Mesh + Dependency Graph
+# Each service is an independent failure domain.
+# In production: postgres → RDS Multi-AZ, redis → ElastiCache,
+# elasticsearch → Managed ES, minio → S3 with cross-region replication.
+# ============================================================
+
+services:
+
+  # ── PostgreSQL: Primary metadata store ──────────────────────────────────────
+  # Concept: RDBMS for structured metadata, ACID transactions, table partitioning
+  # Scale: read replicas for read-heavy workload (100:1 read:write ratio)
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: photodb
+      POSTGRES_USER: photouser
+      POSTGRES_PASSWORD: photopass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/db/migrations:/docker-entrypoint-initdb.d  # auto-runs on first start
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U photouser -d photodb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - photo_net
+
+  # ── Redis: Metadata cache ────────────────────────────────────────────────────
+  # Concept: LRU eviction, TTL-based expiry, cache-aside pattern
+  # Why: Sub-millisecond lookups vs. ~5ms PostgreSQL. At 2,300 reads/sec peak,
+  # even 50% cache hit ratio saves enormous DB load.
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - photo_net
+
+  # ── Elasticsearch: Full-text search ─────────────────────────────────────────
+  # Concept: Inverted index, relevance scoring, analyzer pipelines
+  # Why not PostgreSQL LIKE? LIKE '%keyword%' = full table scan (no index used).
+  # ES inverted index maps word → [doc_ids] in O(1) lookup.
+  elasticsearch:
+    image: elasticsearch:8.13.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    networks:
+      - photo_net
+
+  # ── MinIO: Object storage (S3-compatible) ───────────────────────────────────
+  # Concept: Distributed object storage, key-value blob store, presigned URLs
+  # Three buckets simulate HOT/WARM/COLD storage tiers:
+  #   photos-hot  → S3 Standard    (0-12 months)
+  #   photos-warm → S3 Standard-IA (1-3 years)
+  #   photos-cold → S3 Glacier     (3-7 years)
+  # Why not store in PostgreSQL? Blobs balloon VACUUM time, no CDN integration,
+  # can't stream partial ranges, cost: S3=$0.023/GB vs RDS=$0.115/GB
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console → http://localhost:9001
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - photo_net
+
+  # ── MinIO Init: Creates buckets on startup ───────────────────────────────────
+  # Concept: Init container pattern, idempotent infrastructure-as-code
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin123;
+        mc mb --ignore-existing local/photos-hot;
+        mc mb --ignore-existing local/photos-warm;
+        mc mb --ignore-existing local/photos-cold;
+        echo 'Buckets ready: photos-hot (S3 Standard), photos-warm (S3-IA), photos-cold (Glacier)';
+      "
+    networks:
+      - photo_net
+
+  # ── FastAPI Backend ──────────────────────────────────────────────────────────
+  # Concept: Stateless application tier — the horizontal scaling point.
+  # Each instance is identical; load balancer distributes across N instances.
+  # State lives in external services (DB, Redis, MinIO) — not in-process.
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app  # live-reload for development
+    networks:
+      - photo_net
+
+  # ── Tier Migration Worker ────────────────────────────────────────────────────
+  # Concept: Background job workers, separation of concerns, data lifecycle mgmt
+  # Runs independently of API tier — can be scaled/scheduled separately.
+  # In production: AWS Lambda on cron, or Celery Beat worker.
+  migration-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: python /app/scripts/tier_migration_cron.py
+    env_file:
+      - .env
+    depends_on:
+      - backend
+    networks:
+      - photo_net
+
+  # ── Frontend: Nginx static server ────────────────────────────────────────────
+  # Concept: CDN-able static assets, complete FE/BE separation
+  # In production: deploy frontend to S3 + CloudFront. Zero backend involvement.
+  frontend:
+    image: nginx:alpine
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+    ports:
+      - "3000:80"
+    networks:
+      - photo_net
+
+volumes:
+  postgres_data:
+  redis_data:
+  es_data:
+  minio_data:
+
+networks:
+  photo_net:
+    driver: bridge
