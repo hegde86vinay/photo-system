@@ -4,6 +4,16 @@
 
 ---
 
+## 🗺️ Interactive Architecture (Miro Board)
+
+The full system design is visualised as an interactive diagram on Miro — including all service layers, data flows, and storage tiers with live annotations.
+
+**[👉 Open Miro Board](https://miro.com/app/board/uXjVG2ccVFQ=/)**
+
+> The Miro board contains: Client/Frontend Layer → API/Backend Layer → Data Stores (PostgreSQL · Redis · Elasticsearch) → Object Storage Tiers (HOT · WARM · COLD) → Migration Worker, with all 15 labelled connectors, capacity callouts, design pattern summaries, and API reference.
+
+---
+
 ## Table of Contents
 1. [Capacity Estimation](#1-capacity-estimation)
 2. [Database & Storage Choices](#2-database--storage-choices)
@@ -118,6 +128,16 @@ minio    (healthy) ──► minio-init (creates 3 buckets) ─┘
 > **File:** `backend/services/photo_service.py → upload_photo()`
 > **Ordering principle:** MinIO upload first (durability before metadata). If MinIO fails, no orphan DB row.
 
+### What happens and why
+
+When a user uploads a photo, the system must guarantee **two things simultaneously**: the binary never gets lost (100% durability, NFR #4) and the metadata stays consistent with what's actually stored. The ordering of operations is intentional:
+
+1. **Validate first, write never.** Before touching any storage, we reject invalid file types and oversized files at the edge. This avoids paying I/O cost for bad inputs.
+2. **Object storage before the database.** MinIO receives the binary first. If this step fails (network blip, bucket quota), we haven't written a metadata row yet — so there's no dangling record pointing at a missing file. Reversing this order would leave orphan metadata rows on MinIO failure, causing broken photo links.
+3. **PostgreSQL is the source of truth.** Once the binary is safely persisted, we write the canonical metadata row. At this point the photo officially "exists" in the system. The generated UUID from PostgreSQL becomes the stable external identifier.
+4. **Elasticsearch is a replica, not required.** Indexing into Elasticsearch is done asynchronously with fire-and-forget semantics. If ES is temporarily down, the upload still succeeds — the photo is accessible, just not yet searchable. This is explicitly allowed by NFR #3 (eventual consistency). A background retry or re-index job can catch up later.
+5. **Presigned URL returned immediately.** Rather than making the client do a separate round-trip to fetch the photo URL, we generate a 1-hour presigned MinIO URL and embed it in the 201 response. This lets the frontend render the uploaded photo instantly without a second request.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -165,6 +185,31 @@ sequenceDiagram
 
 > **File:** `backend/services/photo_service.py → get_photo()`
 > **Pattern:** Cache-aside (lazy loading) with Redis TTL = 1 hour
+
+### What happens and why
+
+This is the most critical path in the system — at 2,300 reads/sec peak, every millisecond matters. The flow has two distinct paths depending on whether the metadata is already cached.
+
+**Why cache metadata and not the photo binary?**
+Photo binaries average 200 KB each. Caching them in Redis at 2,300 reads/sec would require terabytes of RAM. Instead, we cache only the metadata (≈500 bytes per photo) and let MinIO/CDN handle the binary. Redis holds the "address" of the photo, not the photo itself.
+
+**Cache HIT path (~80% of requests):**
+The request completes in approximately **2–5 ms**:
+- Redis GET is a single O(1) key lookup in memory (~0.2ms)
+- Presigned URL generation is a local HMAC-SHA256 signing operation (~1ms)
+- Client gets back metadata + URL immediately, then downloads directly from MinIO
+
+**Cache MISS path (~20% of requests):**
+The request takes approximately **8–15 ms**:
+- Redis returns nil — we fall through to PostgreSQL
+- The DB query hits `idx_photos_id` (a unique index on UUID + partition key), so even at 5.1B rows it's a fast index seek, not a full scan
+- The result is written back to Redis with a 1-hour TTL before returning — so the next request for the same photo will HIT
+
+**Why DEL on invalidation, not SET?**
+On photo update or tier change, we delete the Redis key rather than writing a new value. This avoids a race condition: if two writes happen concurrently, the slower one could overwrite the faster one's cached value with stale data. DEL forces the next read to go to PostgreSQL for the authoritative value.
+
+**The presigned URL trick (the bandwidth bottleneck solution):**
+The response contains a URL, not bytes. The client then fetches the photo directly from MinIO — the backend is completely out of the data transfer path. At 3.68 Gbps peak, routing image bytes through FastAPI would require dozens of large EC2 instances just for bandwidth. Presigned URLs reduce that to zero backend bandwidth cost. In production, CloudFront caches these presigned responses at edge nodes, achieving <50ms globally.
 
 ```mermaid
 sequenceDiagram
@@ -227,6 +272,28 @@ sequenceDiagram
 
 > **Files:** `backend/services/search_service.py`, `backend/services/photo_service.py → search_photos()`
 > **Pattern:** Dual-write (PostgreSQL source of truth + Elasticsearch search replica)
+
+### What happens and why
+
+Search is the most architecturally interesting flow because it involves two entirely different storage systems working in tandem.
+
+**Why can't we just use PostgreSQL for search?**
+The naive approach — `SELECT * FROM photos WHERE title LIKE '%sneakers%'` — is catastrophically slow at 5.1 billion rows. A `LIKE '%keyword%'` with a leading wildcard cannot use any B-tree index. PostgreSQL must read every single row to check for a match. At 730M rows per year-partition, even a single-year scan would take minutes. Elasticsearch solves this with an **inverted index**: at index time, every word in every title is mapped to a list of document IDs. At search time, looking up "sneakers" is a single hash lookup — O(1) regardless of corpus size.
+
+**The dual-write trade-off:**
+On every upload, we write to both PostgreSQL (authoritative, ACID) and Elasticsearch (search replica, eventual consistency). This means:
+- If ES write fails: the photo is stored and accessible, just not yet searchable. NFR #3 explicitly allows this gap.
+- ES can be rebuilt from scratch at any time by re-scanning PostgreSQL — it's a derived view, not a primary store.
+- In production, a message queue (Kafka/SQS) between the API and ES indexer gives guaranteed delivery with backpressure, at the cost of ~100ms indexing latency.
+
+**BM25 relevance scoring:**
+Elasticsearch uses BM25 (Best Match 25) — an industry-standard term-frequency/inverse-document-frequency algorithm. It ranks "Blue Sneakers Running Shoes" higher than "Shoes" for the query "sneakers" because the former mentions sneakers more prominently relative to document length. The `title^2` field boost means a title match scores twice as highly as a product_id match.
+
+**Fuzzy matching:**
+`fuzziness: "AUTO"` allows Elasticsearch to match "sneakres" → "sneakers" (edit distance 2). This is implemented via a Levenshtein automaton — not a full scan — so it stays fast.
+
+**Why fetch file_path from PostgreSQL after the ES query?**
+Elasticsearch stores only the fields needed for search + result rendering (id, title, product_id, score, tier). The `file_path` (MinIO object key) is not stored in ES — it's large and not needed for ranking. After ES returns the matching IDs, we do a small indexed UUID lookup in PostgreSQL per result. At 20 results per page, this is 20 fast primary-key lookups — negligible overhead compared to the ES query itself. An alternative is storing `file_path` in ES (denormalization) to avoid the PG roundtrip, at the cost of ES storage and keeping the two in sync on file moves.
 
 ```mermaid
 sequenceDiagram
@@ -292,6 +359,24 @@ sequenceDiagram
 > **File:** `backend/services/photo_service.py → download_photo()`
 > **Note:** This endpoint streams bytes through the backend. For production scale, use the presigned URL from `GET /api/photos/{id}` instead.
 
+### What happens and why
+
+The download endpoint is intentionally simpler than the view flow — it streams raw bytes rather than returning a presigned URL. This serves a different use case.
+
+**When would you use this over the presigned URL?**
+- **Server-side processing:** a backend job that needs to read and transform the photo (resize, watermark, format convert) — it can call this endpoint without needing to follow a redirect
+- **Download logging:** if you need to record every download with user identity, timestamp, and IP for audit or billing, streaming through the backend gives you a hook. With presigned URLs, the client hits MinIO directly and the backend never sees the traffic.
+- **Internal service-to-service calls:** microservices inside the same VPC that don't need public presigned URL signatures
+
+**The storage tier resolution:**
+The `storage_tier` field in PostgreSQL tells us exactly which MinIO bucket to look in. HOT photos are in `photos-hot`, WARM in `photos-warm`, COLD in `photos-cold`. The backend resolves the correct bucket before calling MinIO — the client never needs to know which tier a photo is in.
+
+**Range request support:**
+MinIO's `get_object` supports HTTP Range headers, which means a client can request a specific byte range: `Range: bytes=0-1023`. This enables resumable downloads (restart from where you left off) and is essential for video/large file support. The byte stream is piped directly to the response without buffering in memory.
+
+**The bandwidth warning:**
+At 460 MB/s average read bandwidth, routing all downloads through this endpoint would saturate the backend's network interface. A single `c5.2xlarge` EC2 instance has ~625 MB/s network throughput — meaning this single endpoint could max out an entire instance under average load, leaving nothing for upload, search, and view APIs. This is why the presigned URL pattern exists: let MinIO (which scales storage bandwidth independently) absorb the data transfer.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -328,6 +413,28 @@ sequenceDiagram
 
 > **Files:** `backend/services/tier_migration.py`, `backend/scripts/tier_migration_cron.py`
 > **Schedule:** Every 24 hours (configurable via `MIGRATION_INTERVAL_SECONDS`)
+
+### What happens and why
+
+The migration worker is the cost optimization engine of the system. It runs independently of the API tier and silently moves photos between storage tiers based on access recency — without any user-facing disruption.
+
+**Why does this exist?**
+All photos start in the HOT tier (S3 Standard, $0.023/GB). Without migration, 7 years of photos accumulate there and the monthly bill grows linearly to ~$23,460/month. The observation is that photo access follows a power law: photos get most of their views in the first few weeks after upload, then traffic decays sharply. A photo not accessed in 12 months is statistically very unlikely to be accessed again at the same rate. Moving it to a cheaper tier costs nothing in user experience (retrieval is still fast from WARM; only COLD has a multi-hour retrieval delay).
+
+**The decision signal: `last_accessed_at`:**
+Every time a photo is viewed or downloaded, its `last_accessed_at` timestamp is updated in PostgreSQL. The migration job queries this field to identify candidates. A photo is eligible for HOT→WARM if it hasn't been accessed in 365 days. WARM→COLD requires 1,095 days (3 years). These thresholds are configurable via environment variables so the team can tune the cost/latency trade-off without code changes.
+
+**Why batch processing (LIMIT 100)?**
+Processing all eligible photos in a single transaction would create extremely long-running DB transactions, lock rows for extended periods, and risk timeout or OOM. Batching in groups of 100 keeps transactions short, allows the worker to make incremental progress, and means a crash loses at most 100 photos' worth of in-flight migration work (which is safe — the DB still shows their old tier, so the next run retries them).
+
+**The copy-then-verify-then-delete safety protocol:**
+Object storage (S3/MinIO) has no atomic rename or move primitive. The only way to "move" an object is to copy it and then delete the source. This creates a window where the object exists in both places. The verification step (`stat_object`) before deletion closes the critical gap: if the copy failed silently or partially, the stat call will detect it and we abort — leaving the source intact. If the worker crashes after the copy but before the delete, the next run finds the DB still shows the old tier, re-attempts the copy (which is idempotent — same key, same bucket), re-verifies, and cleans up the source. No data loss in any crash scenario.
+
+**Why update the DB before deleting the source?**
+The DB record (`storage_tier='WARM'`) is updated before `remove_object` on the source. This means if the delete fails (transient network error), the DB says WARM but the object exists in both HOT and WARM. The next migration run will try to copy again (idempotent) and eventually delete the HOT copy. The alternative — delete source first, then update DB — is much worse: a crash between those two steps would leave the DB saying HOT but the object only in WARM, causing failed reads from the HOT bucket.
+
+**Operational independence:**
+The migration worker runs as a completely separate Docker service (`migration-worker`). It can be paused, scaled down to zero, or restarted without affecting the API. In production this would be a Kubernetes CronJob or AWS EventBridge rule triggering a Lambda — no persistent infrastructure needed outside the execution window.
 
 ```mermaid
 sequenceDiagram
